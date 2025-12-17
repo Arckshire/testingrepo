@@ -4,27 +4,33 @@ import numpy as np
 from io import BytesIO, StringIO
 
 # ====== CONFIGURABLE COLUMN NAMES (EASY TO CHANGE) ======
+
+# Raw input columns
 TRACKED_COL = "Tracked"
 PICKUP_TS_COL = "Pickup Departure UTC Timestamp Raw"
-DROPOFF_TS_COL = "Dropoff Arrival UTC Timestamp Raw"
+DROPOFF_TS_COL = "Dropoff Arrival UTC Timestamp Raw"  # "Dropoff" as one word
+RAW_PICKUP_CITY_STATE_COL = "Pickup City State"
+RAW_DROPOFF_CITY_STATE_COL = "Dropoff City State"
 
 BILL_OF_LADING_COL = "Bill of lading"
 PICKUP_NAME_COL = "Pickup name"
+PICKUP_COUNTRY_COL = "Pickup country"
+DROPOFF_NAME_COL = "Drop-off name"
+DROPOFF_COUNTRY_COL = "Drop-off country"
+
+# Derived/output columns
 PICKUP_CITY_COL = "Pickup city"
 PICKUP_STATE_COL = "Pickup state"
-PICKUP_COUNTRY_COL = "Pickup country"
-DROPOFF_NAME_COL = "Dropoff name"
-DROPOFF_CITY_COL = "Dropoff city"
-DROPOFF_STATE_COL = "Dropoff state"
-DROPOFF_COUNTRY_COL = "Dropoff country"
+DROPOFF_CITY_COL = "Drop-off city"
+DROPOFF_STATE_COL = "Drop-off state"
 
 IN_TRANSIT_OUTPUT_COL = "In transit time"
 
 
-# ====== COLUMN STANDARDIZATION (FIX FOR YOUR ERROR) ======
+# ====== COLUMN STANDARDIZATION (TOLERANT MATCHING) ======
 
 def _normalize_col_name(name: str) -> str:
-    """Lowercase, strip, collapse spaces for matching."""
+    """Lowercase, strip, collapse multiple spaces for matching."""
     if name is None:
         return ""
     return " ".join(str(name).strip().lower().split())
@@ -41,20 +47,18 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     # Map normalized existing names -> original names
     existing_norm = {_normalize_col_name(c): c for c in df.columns}
 
-    # All required / used columns
+    # All required / used raw columns
     expected_cols = [
         TRACKED_COL,
         PICKUP_TS_COL,
         DROPOFF_TS_COL,
         BILL_OF_LADING_COL,
         PICKUP_NAME_COL,
-        PICKUP_CITY_COL,
-        PICKUP_STATE_COL,
         PICKUP_COUNTRY_COL,
         DROPOFF_NAME_COL,
-        DROPOFF_CITY_COL,
-        DROPOFF_STATE_COL,
         DROPOFF_COUNTRY_COL,
+        RAW_PICKUP_CITY_STATE_COL,
+        RAW_DROPOFF_CITY_STATE_COL,
     ]
 
     rename_map = {}
@@ -62,7 +66,6 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
         norm_expected = _normalize_col_name(expected)
         if norm_expected in existing_norm:
             original_name = existing_norm[norm_expected]
-            # Rename the original column to the exact expected constant
             rename_map[original_name] = expected
 
     if rename_map:
@@ -78,13 +81,11 @@ def validate_columns(df: pd.DataFrame):
         DROPOFF_TS_COL,
         BILL_OF_LADING_COL,
         PICKUP_NAME_COL,
-        PICKUP_CITY_COL,
-        PICKUP_STATE_COL,
         PICKUP_COUNTRY_COL,
         DROPOFF_NAME_COL,
-        DROPOFF_CITY_COL,
-        DROPOFF_STATE_COL,
         DROPOFF_COUNTRY_COL,
+        RAW_PICKUP_CITY_STATE_COL,
+        RAW_DROPOFF_CITY_STATE_COL,
     ]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
@@ -92,6 +93,8 @@ def validate_columns(df: pd.DataFrame):
             f"The following required columns are missing from the uploaded file: {', '.join(missing)}"
         )
 
+
+# ====== CORE LOGIC ======
 
 def get_tracked_untracked_masks(df: pd.DataFrame):
     """
@@ -102,6 +105,34 @@ def get_tracked_untracked_masks(df: pd.DataFrame):
     tracked_mask = tracked_series == "TRUE"
     untracked_mask = tracked_series == "FALSE"
     return tracked_mask, untracked_mask
+
+
+def split_city_state(series: pd.Series):
+    """
+    Split 'City - State' or 'City-State' into two Series: city, state.
+    - Before '-' -> city
+    - After '-'  -> state
+    - Whitespace is stripped.
+    - If no '-' is found, whole string goes to city, state is ''.
+    """
+    cities = []
+    states = []
+    for v in series:
+        if pd.isna(v):
+            cities.append("")
+            states.append("")
+        else:
+            text = str(v)
+            parts = text.split("-", 1)
+            if len(parts) == 2:
+                city = parts[0].strip()
+                state = parts[1].strip()
+            else:
+                city = text.strip()
+                state = ""
+            cities.append(city)
+            states.append(state)
+    return pd.Series(cities, index=series.index), pd.Series(states, index=series.index)
 
 
 def compute_in_transit(df_tracked: pd.DataFrame):
@@ -158,8 +189,7 @@ def compute_in_transit(df_tracked: pd.DataFrame):
                 return float(floor)
             else:
                 return float(floor + 1.0)
-        # Any other case (e.g., <= 0) shouldn't appear here if valid_mask is correct,
-        # but we defensively treat as NaN.
+        # Any other case (<=0) should not appear given valid_mask, but be defensive
         return np.nan
 
     df_valid[IN_TRANSIT_OUTPUT_COL] = df_valid["transit_days_raw"].apply(round_transit_days)
@@ -227,10 +257,10 @@ def build_excel_file(
             "Pickup city",
             "Pickup state",
             "Pickup country",
-            "Dropoff name",
-            "Dropoff city",
-            "Dropoff state",
-            "Dropoff country",
+            "Drop-off name",
+            "Drop-off city",
+            "Drop-off state",
+            "Drop-off country",
             "In transit time",
         ]
         header_row_idx = 6
@@ -305,10 +335,10 @@ def build_csv_file(
         "Pickup city",
         "Pickup state",
         "Pickup country",
-        "Dropoff name",
-        "Dropoff city",
-        "Dropoff state",
-        "Dropoff country",
+        "Drop-off name",
+        "Drop-off city",
+        "Drop-off state",
+        "Drop-off country",
         "In transit time",
     ]
     rows.append(pad_row(headers))
@@ -340,10 +370,21 @@ def build_csv_file(
 
 
 def process_file(df: pd.DataFrame):
-    # Validate columns after standardization
+    df = df.copy()
+
+    # Validate required raw columns first
     validate_columns(df)
 
     original_total_count = len(df)
+
+    # Derive city/state columns from "Pickup City State" and "Dropoff City State"
+    pickup_cities, pickup_states = split_city_state(df[RAW_PICKUP_CITY_STATE_COL])
+    dropoff_cities, dropoff_states = split_city_state(df[RAW_DROPOFF_CITY_STATE_COL])
+
+    df[PICKUP_CITY_COL] = pickup_cities
+    df[PICKUP_STATE_COL] = pickup_states
+    df[DROPOFF_CITY_COL] = dropoff_cities
+    df[DROPOFF_STATE_COL] = dropoff_states
 
     tracked_mask, untracked_mask = get_tracked_untracked_masks(df)
 
@@ -399,7 +440,7 @@ st.write(
 uploaded_file = st.file_uploader(
     "Upload your raw FTL tracking file",
     type=["csv", "xlsx", "xls"],
-    help="The file should contain the required columns such as Tracked, Pickup/Dropoff timestamps, and lane details.",
+    help="The file should contain the required columns such as Tracked, timestamps, and lane details.",
 )
 
 if uploaded_file is not None:
@@ -413,9 +454,9 @@ if uploaded_file is not None:
         # Normalize/standardize column names to match our constants
         df_input = standardize_columns(df_input)
 
-        st.subheader("Preview of uploaded data")
+        st.subheader("Preview of uploaded data (after column standardization)")
         st.dataframe(df_input.head(20), use_container_width=True)
-        # Uncomment this line if you want to debug column names:
+        # Uncomment this if you want to see exact column names:
         # st.write("Columns after standardization:", list(df_input.columns))
 
         if st.button("Process file"):
