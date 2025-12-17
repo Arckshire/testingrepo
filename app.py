@@ -15,8 +15,8 @@ RAW_DROPOFF_CITY_STATE_COL = "Dropoff City State"
 BILL_OF_LADING_COL = "Bill of lading"
 PICKUP_NAME_COL = "Pickup name"
 PICKUP_COUNTRY_COL = "Pickup country"
-DROPOFF_NAME_COL = "Drop-off name"
-DROPOFF_COUNTRY_COL = "Drop-off country"
+DROPOFF_NAME_COL = "Dropoff name"
+DROPOFF_COUNTRY_COL = "Dropoff country"
 
 # Derived/output columns
 PICKUP_CITY_COL = "Pickup city"
