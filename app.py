@@ -6,17 +6,17 @@ from io import BytesIO, StringIO
 # ====== CONFIGURABLE COLUMN NAMES (EASY TO CHANGE) ======
 TRACKED_COL = "Tracked"
 PICKUP_TS_COL = "Pickup Departure UTC Timestamp Raw"
-DROPOFF_TS_COL = "Drop-off Arrival UTC Timestamp Raw"
+DROPOFF_TS_COL = "Dropoff Arrival UTC Timestamp Raw"
 
 BILL_OF_LADING_COL = "Bill of lading"
 PICKUP_NAME_COL = "Pickup name"
 PICKUP_CITY_COL = "Pickup city"
 PICKUP_STATE_COL = "Pickup state"
 PICKUP_COUNTRY_COL = "Pickup country"
-DROPOFF_NAME_COL = "Drop-off name"
-DROPOFF_CITY_COL = "Drop-off city"
-DROPOFF_STATE_COL = "Drop-off state"
-DROPOFF_COUNTRY_COL = "Drop-off country"
+DROPOFF_NAME_COL = "Dropoff name"
+DROPOFF_CITY_COL = "Dropoff city"
+DROPOFF_STATE_COL = "Dropoff state"
+DROPOFF_COUNTRY_COL = "Dropoff country"
 
 IN_TRANSIT_OUTPUT_COL = "In transit time"
 
@@ -227,10 +227,10 @@ def build_excel_file(
             "Pickup city",
             "Pickup state",
             "Pickup country",
-            "Drop-off name",
-            "Drop-off city",
-            "Drop-off state",
-            "Drop-off country",
+            "Dropoff name",
+            "Dropoff city",
+            "Dropoff state",
+            "Dropoff country",
             "In transit time",
         ]
         header_row_idx = 6
@@ -305,10 +305,10 @@ def build_csv_file(
         "Pickup city",
         "Pickup state",
         "Pickup country",
-        "Drop-off name",
-        "Drop-off city",
-        "Drop-off state",
-        "Drop-off country",
+        "Dropoff name",
+        "Dropoff city",
+        "Dropoff state",
+        "Dropoff country",
         "In transit time",
     ]
     rows.append(pad_row(headers))
@@ -399,7 +399,7 @@ st.write(
 uploaded_file = st.file_uploader(
     "Upload your raw FTL tracking file",
     type=["csv", "xlsx", "xls"],
-    help="The file should contain the required columns such as Tracked, Pickup/Drop-off timestamps, and lane details.",
+    help="The file should contain the required columns such as Tracked, Pickup/Dropoff timestamps, and lane details.",
 )
 
 if uploaded_file is not None:
