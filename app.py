@@ -2,522 +2,343 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO, StringIO
+from openpyxl import Workbook
+import csv
 
-# ====== CONFIGURABLE COLUMN NAMES (EASY TO CHANGE) ======
+# === Column name configuration (change these if your raw file uses different labels) ===
+TRACKED_COL_NAME = "Tracked"
+PICKUP_TS_COL_NAME = "Pickup Departure UTC Timestamp Raw"
+DROPOFF_TS_COL_NAME = "Drop-off Arrival UTC Timestamp Raw"
 
-# Raw input columns
-TRACKED_COL = "Tracked"
-PICKUP_TS_COL = "Pickup Departure UTC Timestamp Raw"
-DROPOFF_TS_COL = "Dropoff Arrival UTC Timestamp Raw"  # "Dropoff" as one word
-RAW_PICKUP_CITY_STATE_COL = "Pickup City State"
-RAW_DROPOFF_CITY_STATE_COL = "Dropoff City State"
-
-BILL_OF_LADING_COL = "Bill of lading"
-PICKUP_NAME_COL = "Pickup name"
-PICKUP_COUNTRY_COL = "Pickup country"
-DROPOFF_NAME_COL = "Dropoff name"
-DROPOFF_COUNTRY_COL = "Dropoff country"
-
-# Derived/output columns
-PICKUP_CITY_COL = "Pickup city"
-PICKUP_STATE_COL = "Pickup state"
-DROPOFF_CITY_COL = "Drop-off city"
-DROPOFF_STATE_COL = "Drop-off state"
-
-IN_TRANSIT_OUTPUT_COL = "In transit time"
+BOL_COL_NAME = "Bill of lading"
+PICKUP_NAME_COL_NAME = "Pickup name"
+PICKUP_CITY_STATE_COL_NAME = "Pickup cityState"
+PICKUP_COUNTRY_COL_NAME = "Pickup country"
+DROPOFF_NAME_COL_NAME = "Dropoff name"
+DROPOFF_CITY_STATE_COL_NAME = "Dropoff city state"
+DROPOFF_COUNTRY_COL_NAME = "Dropoff country"
 
 
-# ====== COLUMN STANDARDIZATION (TOLERANT MATCHING) ======
-
-def _normalize_col_name(name: str) -> str:
-    """Lowercase, strip, collapse multiple spaces for matching."""
-    if name is None:
-        return ""
-    return " ".join(str(name).strip().lower().split())
+def normalize_col_name(name: str) -> str:
+    """Normalize column names to compare them case-insensitively and ignoring spaces/punctuation."""
+    return "".join(ch.lower() for ch in str(name) if ch.isalnum())
 
 
-def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Map columns in the uploaded file to our expected constant names
-    using a case-insensitive, space-insensitive match.
-    If a match is found, rename the column in df to the constant name.
-    """
-    df = df.copy()
-
-    # Map normalized existing names -> original names
-    existing_norm = {_normalize_col_name(c): c for c in df.columns}
-
-    # All required / used raw columns
-    expected_cols = [
-        TRACKED_COL,
-        PICKUP_TS_COL,
-        DROPOFF_TS_COL,
-        BILL_OF_LADING_COL,
-        PICKUP_NAME_COL,
-        PICKUP_COUNTRY_COL,
-        DROPOFF_NAME_COL,
-        DROPOFF_COUNTRY_COL,
-        RAW_PICKUP_CITY_STATE_COL,
-        RAW_DROPOFF_CITY_STATE_COL,
-    ]
-
-    rename_map = {}
-    for expected in expected_cols:
-        norm_expected = _normalize_col_name(expected)
-        if norm_expected in existing_norm:
-            original_name = existing_norm[norm_expected]
-            rename_map[original_name] = expected
-
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    return df
+def find_column(df: pd.DataFrame, target_name: str) -> str:
+    """Return the actual column name from df that matches target_name (case/space insensitive)."""
+    norm_target = normalize_col_name(target_name)
+    for col in df.columns:
+        if normalize_col_name(col) == norm_target:
+            return col
+    raise KeyError(f"Could not find a column matching '{target_name}' in the uploaded file.")
 
 
-def validate_columns(df: pd.DataFrame):
-    required_cols = [
-        TRACKED_COL,
-        PICKUP_TS_COL,
-        DROPOFF_TS_COL,
-        BILL_OF_LADING_COL,
-        PICKUP_NAME_COL,
-        PICKUP_COUNTRY_COL,
-        DROPOFF_NAME_COL,
-        DROPOFF_COUNTRY_COL,
-        RAW_PICKUP_CITY_STATE_COL,
-        RAW_DROPOFF_CITY_STATE_COL,
-    ]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError(
-            f"The following required columns are missing from the uploaded file: {', '.join(missing)}"
-        )
+def coerce_tracked_flag(series: pd.Series) -> pd.Series:
+    """Convert the 'tracked' column into a clean boolean Series."""
+    if series.dtype == bool:
+        return series.fillna(False)
+
+    # Handle booleans stored as strings / numbers
+    s = series.astype(str).str.strip().str.lower()
+    truthy = {"true", "1", "yes", "y"}
+    return s.isin(truthy)
 
 
-# ====== CORE LOGIC ======
-
-def get_tracked_untracked_masks(df: pd.DataFrame):
-    """
-    Use the TRACKED_COL to build boolean masks for tracked and untracked.
-    Assumes values TRUE/FALSE, but also robust to 'True'/'False' strings and actual booleans.
-    """
-    tracked_series = df[TRACKED_COL].astype(str).str.upper().str.strip()
-    tracked_mask = tracked_series == "TRUE"
-    untracked_mask = tracked_series == "FALSE"
-    return tracked_mask, untracked_mask
+def clean_and_parse_timestamp(series: pd.Series) -> pd.Series:
+    """Clean obvious 'zero' placeholders and parse timestamps to datetime (UTC)."""
+    s = series.replace({0: pd.NA, 0.0: pd.NA, "0": pd.NA, "0000-00-00 00:00:00": pd.NA})
+    return pd.to_datetime(s, errors="coerce", utc=True)
 
 
-def split_city_state(series: pd.Series):
-    """
-    Split 'City - State' or 'City-State' into two Series: city, state.
-    - Before '-' -> city
-    - After '-'  -> state
-    - Whitespace is stripped.
-    - If no '-' is found, whole string goes to city, state is ''.
-    """
-    cities = []
-    states = []
-    for v in series:
-        if pd.isna(v):
-            cities.append("")
-            states.append("")
-        else:
-            text = str(v)
-            parts = text.split("-", 1)
-            if len(parts) == 2:
-                city = parts[0].strip()
-                state = parts[1].strip()
-            else:
-                city = text.strip()
-                state = ""
-            cities.append(city)
-            states.append(state)
-    return pd.Series(cities, index=series.index), pd.Series(states, index=series.index)
-
-
-def compute_in_transit(df_tracked: pd.DataFrame):
-    """
-    For tracked shipments:
-    - Classify missed milestones (missing timestamps / non-positive duration)
-    - Compute rounded in-transit time for valid shipments
-
-    Returns:
-      detail_df: dataframe of shipments with VALID in-transit time (one row per shipment)
-      missed_milestone_count: count of rows with missing/invalid timestamps or non-positive duration
-    """
-    df_tracked = df_tracked.copy()
-
-    # Ensure datetime
-    df_tracked[PICKUP_TS_COL] = pd.to_datetime(
-        df_tracked[PICKUP_TS_COL], errors="coerce", utc=True
-    )
-    df_tracked[DROPOFF_TS_COL] = pd.to_datetime(
-        df_tracked[DROPOFF_TS_COL], errors="coerce", utc=True
-    )
-
-    pickup = df_tracked[PICKUP_TS_COL]
-    dropoff = df_tracked[DROPOFF_TS_COL]
-
-    has_both = pickup.notna() & dropoff.notna()
-    duration_days = (dropoff - pickup).dt.total_seconds() / (24 * 3600)
-
-    # Valid only if both timestamps present AND duration strictly > 0
-    positive_duration = duration_days > 0
-    valid_mask = has_both & positive_duration
-
-    # Missed milestone = everything else
-    missed_mask = ~valid_mask
-    missed_milestone_count = int(missed_mask.sum())
-
-    # Keep only valid rows for in-transit calculation
-    df_valid = df_tracked[valid_mask].copy()
-    df_valid["transit_days_raw"] = duration_days[valid_mask]
-
-    # Rounding logic
-    def round_transit_days(x: float) -> float:
-        # 0 < x < 0.5 → 0.5
-        if 0 < x < 0.5:
-            return 0.5
-        # 0.5 <= x < 1 → 1
-        if 0.5 <= x < 1:
-            return 1.0
-        # x >= 1 → round to nearest whole number, halves up
-        if x >= 1:
-            floor = np.floor(x)
-            frac = x - floor
-            if frac < 0.5:
-                return float(floor)
-            else:
-                return float(floor + 1.0)
-        # Any other case (<=0) should not appear given valid_mask, but be defensive
+def round_transit_days(days: float) -> float:
+    """Apply custom rounding logic for transit days."""
+    if pd.isna(days):
         return np.nan
+    if days <= 0:
+        # Non-positive durations are considered missed milestones
+        return np.nan
+    if days < 0.5:
+        return 0.5
+    if days < 1:
+        return 1.0
 
-    df_valid[IN_TRANSIT_OUTPUT_COL] = df_valid["transit_days_raw"].apply(round_transit_days)
-
-    # Prepare the detail table (only the columns required for output)
-    detail_cols = [
-        BILL_OF_LADING_COL,
-        PICKUP_NAME_COL,
-        PICKUP_CITY_COL,
-        PICKUP_STATE_COL,
-        PICKUP_COUNTRY_COL,
-        DROPOFF_NAME_COL,
-        DROPOFF_CITY_COL,
-        DROPOFF_STATE_COL,
-        DROPOFF_COUNTRY_COL,
-        IN_TRANSIT_OUTPUT_COL,
-    ]
-
-    detail_df = df_valid[detail_cols].copy()
-
-    return detail_df, missed_milestone_count
+    integer_part = int(np.floor(days))
+    frac_part = float(days - integer_part)
+    if frac_part < 0.5:
+        return float(integer_part)
+    else:
+        return float(integer_part + 1)
 
 
-def build_excel_file(
-    tracked_count: int,
-    untracked_count: int,
-    missed_milestone_count: int,
-    detail_df: pd.DataFrame,
-    original_total_count: int,
-) -> bytes:
-    # Grand total = total number of rows in original file
-    grand_total = original_total_count
+def build_detail_df(
+    df_tracked: pd.DataFrame,
+    pickup_ts: pd.Series,
+    dropoff_ts: pd.Series,
+    rounded_transit: pd.Series,
+    missed_mask: pd.Series,
+) -> pd.DataFrame:
+    """Build the detailed table for tracked shipments with valid in-transit time."""
+    valid_mask = ~missed_mask & rounded_transit.notna()
 
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm:ss") as writer:
-        workbook = writer.book
-        sheet_name = "In-transit summary"
-        worksheet = workbook.add_worksheet(sheet_name)
-        writer.sheets[sheet_name] = worksheet
+    df_valid = df_tracked.loc[valid_mask].copy()
+    df_valid["In transit time"] = rounded_transit.loc[valid_mask].values
 
-        # Summary table (A1:B5, with D1:E1 definition)
-        worksheet.write("A1", "Label")
-        worksheet.write("B1", "Shipment Count")
-        worksheet.write("D1", "Definition of in transit time")
-        worksheet.write("E1", "Time taken from departure to arrival")
+    # Map raw column names to clean output labels
+    bol_col = find_column(df_tracked, BOL_COL_NAME)
+    pickup_name_col = find_column(df_tracked, PICKUP_NAME_COL_NAME)
+    pickup_city_state_col = find_column(df_tracked, PICKUP_CITY_STATE_COL_NAME)
+    pickup_country_col = find_column(df_tracked, PICKUP_COUNTRY_COL_NAME)
+    dropoff_name_col = find_column(df_tracked, DROPOFF_NAME_COL_NAME)
+    dropoff_city_state_col = find_column(df_tracked, DROPOFF_CITY_STATE_COL_NAME)
+    dropoff_country_col = find_column(df_tracked, DROPOFF_COUNTRY_COL_NAME)
 
-        worksheet.write("A2", "Tracked")
-        worksheet.write("B2", tracked_count)
+    detail_df = pd.DataFrame({
+        "Bill of lading": df_valid[bol_col].values,
+        "Pickup name": df_valid[pickup_name_col].values,
+        "Pickup City State": df_valid[pickup_city_state_col].values,
+        "Pickup country": df_valid[pickup_country_col].values,
+        "Dropoff name": df_valid[dropoff_name_col].values,
+        "Dropoff City State": df_valid[dropoff_city_state_col].values,
+        "Dropoff country": df_valid[dropoff_country_col].values,
+        "In transit time": df_valid["In transit time"].values,
+    })
 
-        worksheet.write("A3", "Missed milestone")
-        worksheet.write("B3", missed_milestone_count)
-
-        worksheet.write("A4", "Untracked")
-        worksheet.write("B4", untracked_count)
-
-        worksheet.write("A5", "Grand total")
-        worksheet.write("B5", grand_total)
-
-        # Blank row 6 (index 5) – intentionally left blank
-
-        # Detailed tracked shipments table header at row 7 (index 6)
-        headers = [
-            "Bill of lading",
-            "Pickup name",
-            "Pickup city",
-            "Pickup state",
-            "Pickup country",
-            "Drop-off name",
-            "Drop-off city",
-            "Drop-off state",
-            "Drop-off country",
-            "In transit time",
-        ]
-        header_row_idx = 6
-        for col_idx, header in enumerate(headers):
-            worksheet.write(header_row_idx, col_idx, header)
-
-        # Data starts at row 8 (index 7)
-        start_row_idx = 7
-        for row_offset, (_, row) in enumerate(detail_df.iterrows()):
-            excel_row = start_row_idx + row_offset
-            worksheet.write(excel_row, 0, row[BILL_OF_LADING_COL])
-            worksheet.write(excel_row, 1, row[PICKUP_NAME_COL])
-            worksheet.write(excel_row, 2, row[PICKUP_CITY_COL])
-            worksheet.write(excel_row, 3, row[PICKUP_STATE_COL])
-            worksheet.write(excel_row, 4, row[PICKUP_COUNTRY_COL])
-            worksheet.write(excel_row, 5, row[DROPOFF_NAME_COL])
-            worksheet.write(excel_row, 6, row[DROPOFF_CITY_COL])
-            worksheet.write(excel_row, 7, row[DROPOFF_STATE_COL])
-            worksheet.write(excel_row, 8, row[DROPOFF_COUNTRY_COL])
-            worksheet.write(excel_row, 9, row[IN_TRANSIT_OUTPUT_COL])
-
-    output.seek(0)
-    return output.getvalue()
+    return detail_df
 
 
-def build_csv_file(
-    tracked_count: int,
-    untracked_count: int,
-    missed_milestone_count: int,
-    detail_df: pd.DataFrame,
-    original_total_count: int,
-) -> str:
-    grand_total = original_total_count
-    max_cols = 10  # A–J
+def build_excel_file(summary_counts: dict, detail_df: pd.DataFrame) -> bytes:
+    """Create the processed Excel file with the required layout."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "In-Transit Report"
 
-    def pad_row(values):
-        row = list(values)
-        if len(row) < max_cols:
-            row.extend([""] * (max_cols - len(row)))
-        else:
-            row = row[:max_cols]
-        return row
+    # Summary header row
+    ws["A1"] = "Label"
+    ws["B1"] = "Shipment Count"
+    ws["D1"] = "Definition of in transit time"
+    ws["E1"] = "Time taken from departure to arrival"
 
-    rows = []
+    # Summary rows
+    ws["A2"] = "Tracked"
+    ws["B2"] = summary_counts["tracked_count"]
 
-    # Row 1: headers for summary + definition
-    rows.append(
-        pad_row(
-            [
-                "Label",
-                "Shipment Count",
-                "",
-                "Definition of in transit time",
-                "Time taken from departure to arrival",
-            ]
-        )
-    )
+    ws["A3"] = "Missed milestone"
+    ws["B3"] = summary_counts["missed_milestone_count"]
 
-    # Row 2–5: summary
-    rows.append(pad_row(["Tracked", tracked_count]))
-    rows.append(pad_row(["Missed milestone", missed_milestone_count]))
-    rows.append(pad_row(["Untracked", untracked_count]))
-    rows.append(pad_row(["Grand total", grand_total]))
+    ws["A4"] = "Untracked"
+    ws["B4"] = summary_counts["untracked_count"]
 
-    # Row 6: blank separator
-    rows.append(pad_row([""]))
+    ws["A5"] = "Grand total"
+    ws["B5"] = summary_counts["grand_total"]
 
-    # Row 7: detail header
+    # Row 6 left blank (separator)
+
+    # Detailed table header at row 7
+    # Using contiguous columns A–H for the detail table.
     headers = [
         "Bill of lading",
         "Pickup name",
-        "Pickup city",
-        "Pickup state",
+        "Pickup City State",
         "Pickup country",
-        "Drop-off name",
-        "Drop-off city",
-        "Drop-off state",
-        "Drop-off country",
+        "Dropoff name",
+        "Dropoff City State",
+        "Dropoff country",
         "In transit time",
     ]
-    rows.append(pad_row(headers))
+    for col_idx, header in enumerate(headers, start=1):
+        ws.cell(row=7, column=col_idx, value=header)
 
-    # From Row 8: detail data (only valid in-transit shipments)
-    for _, r in detail_df.iterrows():
-        rows.append(
-            pad_row(
-                [
-                    r[BILL_OF_LADING_COL],
-                    r[PICKUP_NAME_COL],
-                    r[PICKUP_CITY_COL],
-                    r[PICKUP_STATE_COL],
-                    r[PICKUP_COUNTRY_COL],
-                    r[DROPOFF_NAME_COL],
-                    r[DROPOFF_CITY_COL],
-                    r[DROPOFF_STATE_COL],
-                    r[DROPOFF_COUNTRY_COL],
-                    r[IN_TRANSIT_OUTPUT_COL],
-                ]
-            )
-        )
+    # Data from row 8 downward
+    start_row = 8
+    for row_idx, (_, row) in enumerate(detail_df.iterrows(), start=start_row):
+        ws.cell(row=row_idx, column=1, value=row["Bill of lading"])
+        ws.cell(row=row_idx, column=2, value=row["Pickup name"])
+        ws.cell(row=row_idx, column=3, value=row["Pickup City State"])
+        ws.cell(row=row_idx, column=4, value=row["Pickup country"])
+        ws.cell(row=row_idx, column=5, value=row["Dropoff name"])
+        ws.cell(row=row_idx, column=6, value=row["Dropoff City State"])
+        ws.cell(row=row_idx, column=7, value=row["Dropoff country"])
+        ws.cell(row=row_idx, column=8, value=row["In transit time"])
 
-    csv_df = pd.DataFrame(rows)
-    buffer = StringIO()
-    # No header row, because we already included our own "row 1"
-    csv_df.to_csv(buffer, index=False, header=False)
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
     return buffer.getvalue()
 
 
-def process_file(df: pd.DataFrame):
-    df = df.copy()
+def build_csv_file(summary_counts: dict, detail_df: pd.DataFrame) -> str:
+    """Create a CSV string approximating the Excel layout."""
+    output = StringIO()
+    writer = csv.writer(output)
 
-    # Validate required raw columns first
-    validate_columns(df)
+    # Summary section
+    writer.writerow(["Label", "Shipment Count", "", "Definition of in transit time", "Time taken from departure to arrival"])
+    writer.writerow(["Tracked", summary_counts["tracked_count"]])
+    writer.writerow(["Missed milestone", summary_counts["missed_milestone_count"]])
+    writer.writerow(["Untracked", summary_counts["untracked_count"]])
+    writer.writerow(["Grand total", summary_counts["grand_total"]])
 
-    original_total_count = len(df)
+    # Blank row
+    writer.writerow([])
 
-    # Derive city/state columns from "Pickup City State" and "Dropoff City State"
-    pickup_cities, pickup_states = split_city_state(df[RAW_PICKUP_CITY_STATE_COL])
-    dropoff_cities, dropoff_states = split_city_state(df[RAW_DROPOFF_CITY_STATE_COL])
+    # Detailed header
+    writer.writerow([
+        "Bill of lading",
+        "Pickup name",
+        "Pickup City State",
+        "Pickup country",
+        "Dropoff name",
+        "Dropoff City State",
+        "Dropoff country",
+        "In transit time",
+    ])
 
-    df[PICKUP_CITY_COL] = pickup_cities
-    df[PICKUP_STATE_COL] = pickup_states
-    df[DROPOFF_CITY_COL] = dropoff_cities
-    df[DROPOFF_STATE_COL] = dropoff_states
+    # Detailed rows
+    for _, row in detail_df.iterrows():
+        writer.writerow([
+            row["Bill of lading"],
+            row["Pickup name"],
+            row["Pickup City State"],
+            row["Pickup country"],
+            row["Dropoff name"],
+            row["Dropoff City State"],
+            row["Dropoff country"],
+            row["In transit time"],
+        ])
 
-    tracked_mask, untracked_mask = get_tracked_untracked_masks(df)
+    return output.getvalue()
 
-    df_tracked = df[tracked_mask].copy()
-    df_untracked = df[untracked_mask].copy()
 
-    tracked_count = int(len(df_tracked))
-    untracked_count = int(len(df_untracked))
+def main():
+    st.title("FTL In-Transit Time Calculator")
 
-    # Compute in-transit & missed milestones within tracked
-    detail_df, missed_milestone_count = compute_in_transit(df_tracked)
-
-    actual_tracked_with_valid_transit = len(detail_df)
-
-    # Build files for download
-    excel_bytes = build_excel_file(
-        tracked_count=tracked_count,
-        untracked_count=untracked_count,
-        missed_milestone_count=missed_milestone_count,
-        detail_df=detail_df,
-        original_total_count=original_total_count,
+    st.write(
+        "Upload a raw FTL tracking file (CSV or Excel). "
+        "The app will classify tracked/untracked shipments, "
+        "detect missed milestones, and calculate in-transit time in days."
     )
-    csv_str = build_csv_file(
-        tracked_count=tracked_count,
-        untracked_count=untracked_count,
-        missed_milestone_count=missed_milestone_count,
-        detail_df=detail_df,
-        original_total_count=original_total_count,
+
+    uploaded_file = st.file_uploader(
+        "Upload raw FTL tracking file",
+        type=["csv", "xlsx", "xls"],
+        help="CSV, XLSX, or XLS files are supported."
     )
+
+    if uploaded_file is None:
+        st.info("👆 Start by uploading a file.")
+        return
+
+    # Read the file into a DataFrame
+    try:
+        if uploaded_file.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"Could not read the uploaded file: {e}")
+        return
+
+    if df.empty:
+        st.warning("The uploaded file appears to be empty.")
+        return
+
+    # Map column names (case/space-insensitive)
+    try:
+        tracked_col = find_column(df, TRACKED_COL_NAME)
+        pickup_ts_col = find_column(df, PICKUP_TS_COL_NAME)
+        dropoff_ts_col = find_column(df, DROPOFF_TS_COL_NAME)
+    except KeyError as e:
+        st.error(str(e))
+        return
+
+    # Step 1 – Tracked vs Untracked
+    tracked_flag = coerce_tracked_flag(df[tracked_col])
+    df_tracked = df[tracked_flag].copy()
+    df_untracked = df[~tracked_flag].copy()
+
+    tracked_count = len(df_tracked)
+    untracked_count = len(df_untracked)
+    total_rows = len(df)
+
+    # Step 2 – In-transit time and missed milestones (within tracked)
+    pickup_ts = clean_and_parse_timestamp(df_tracked[pickup_ts_col])
+    dropoff_ts = clean_and_parse_timestamp(df_tracked[dropoff_ts_col])
+
+    transit_timedelta = dropoff_ts - pickup_ts
+    transit_days = transit_timedelta.dt.total_seconds() / (24 * 60 * 60)
+
+    # Missed milestones: missing timestamps or non-positive duration
+    missed_mask = pickup_ts.isna() | dropoff_ts.isna() | (transit_days <= 0)
+
+    # Round valid transit days using your custom logic
+    rounded_transit = transit_days.apply(round_transit_days)
+
+    missed_milestone_count = int(missed_mask.sum())
+    actual_tracked_with_valid_transit = int((~missed_mask & rounded_transit.notna()).sum())
+
+    # We treat grand total as the total number of rows in the original file
+    grand_total = total_rows
 
     summary_counts = {
         "tracked_count": tracked_count,
         "missed_milestone_count": missed_milestone_count,
         "untracked_count": untracked_count,
-        "grand_total": original_total_count,
+        "grand_total": grand_total,
         "actual_tracked_with_valid_transit": actual_tracked_with_valid_transit,
     }
 
-    return summary_counts, detail_df, excel_bytes, csv_str
-
-
-# ====== STREAMLIT APP ======
-
-st.set_page_config(page_title="FTL In-Transit Time Calculator", layout="wide")
-
-st.title("FTL In-Transit Time Calculator")
-st.write(
-    "Upload a raw FTL tracking file (CSV or Excel). "
-    "The app will calculate in-transit time (in days) for tracked shipments and "
-    "mark missed milestones according to your business rules."
-)
-
-uploaded_file = st.file_uploader(
-    "Upload your raw FTL tracking file",
-    type=["csv", "xlsx", "xls"],
-    help="The file should contain the required columns such as Tracked, timestamps, and lane details.",
-)
-
-if uploaded_file is not None:
+    # Build detail table
     try:
-        # Read CSV or Excel into DataFrame
-        if uploaded_file.name.lower().endswith(".csv"):
-            df_input = pd.read_csv(uploaded_file)
-        else:
-            df_input = pd.read_excel(uploaded_file)
+        detail_df = build_detail_df(
+            df_tracked=df_tracked,
+            pickup_ts=pickup_ts,
+            dropoff_ts=dropoff_ts,
+            rounded_transit=rounded_transit,
+            missed_mask=missed_mask,
+        )
+    except KeyError as e:
+        st.error(str(e))
+        return
 
-        # Normalize/standardize column names to match our constants
-        df_input = standardize_columns(df_input)
+    # Display summary
+    st.subheader("Summary")
 
-        st.subheader("Preview of uploaded data (after column standardization)")
-        st.dataframe(df_input.head(20), use_container_width=True)
-        # Uncomment this if you want to see exact column names:
-        # st.write("Columns after standardization:", list(df_input.columns))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tracked", tracked_count)
+    c2.metric("Missed milestone", missed_milestone_count)
+    c3.metric("Untracked", untracked_count)
+    c4.metric("Grand total", grand_total)
 
-        if st.button("Process file"):
-            with st.spinner("Processing shipments..."):
-                summary_counts, detail_df, excel_bytes, csv_str = process_file(df_input)
+    st.caption(
+        "Note: 'Tracked' includes all shipments where the tracked flag is TRUE "
+        "(including those classified as missed milestones). "
+        "'Grand total' is the total number of rows in the original file."
+    )
 
-            st.success("Processing complete!")
+    # Display detailed table
+    st.subheader("Tracked shipments with valid in-transit time (days)")
+    st.dataframe(detail_df, use_container_width=True)
 
-            # Display summary metrics
-            st.subheader("Summary")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Tracked", summary_counts["tracked_count"])
-            with col2:
-                st.metric("Missed milestone", summary_counts["missed_milestone_count"])
-            with col3:
-                st.metric("Untracked", summary_counts["untracked_count"])
-            with col4:
-                st.metric("Grand total", summary_counts["grand_total"])
+    # Build output files
+    excel_bytes = build_excel_file(summary_counts, detail_df)
+    csv_text = build_csv_file(summary_counts, detail_df)
 
-            # Tabular summary view
-            summary_df = pd.DataFrame(
-                {
-                    "Label": ["Tracked", "Missed milestone", "Untracked", "Grand total"],
-                    "Shipment Count": [
-                        summary_counts["tracked_count"],
-                        summary_counts["missed_milestone_count"],
-                        summary_counts["untracked_count"],
-                        summary_counts["grand_total"],
-                    ],
-                }
-            )
-            st.table(summary_df)
+    st.subheader("Download processed data")
 
-            # Detailed table of valid tracked shipments with in-transit time
-            st.subheader("Tracked shipments with valid in-transit time")
-            st.caption(
-                "Only tracked shipments with both timestamps present and a positive transit duration are shown here."
-            )
-            st.dataframe(detail_df, use_container_width=True)
+    st.download_button(
+        label="⬇️ Download Excel report",
+        data=excel_bytes,
+        file_name="in_transit_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-            # Download buttons
-            st.subheader("Download processed files")
+    st.download_button(
+        label="⬇️ Download CSV report",
+        data=csv_text.encode("utf-8"),
+        file_name="in_transit_report.csv",
+        mime="text/csv",
+    )
 
-            st.download_button(
-                label="⬇️ Download Excel (with summary layout)",
-                data=excel_bytes,
-                file_name="in_transit_processed.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
 
-            st.download_button(
-                label="⬇️ Download CSV (summary + detailed table)",
-                data=csv_str.encode("utf-8"),
-                file_name="in_transit_processed.csv",
-                mime="text/csv",
-            )
-
-    except ValueError as ve:
-        st.error(str(ve))
-    except Exception as e:
-        st.error(f"An unexpected error occurred while processing the file: {e}")
-else:
-    st.info("Please upload a CSV or Excel file to begin.")
+if __name__ == "__main__":
+    main()
