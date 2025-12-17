@@ -21,7 +21,55 @@ DROPOFF_COUNTRY_COL = "Drop-off country"
 IN_TRANSIT_OUTPUT_COL = "In transit time"
 
 
-# ====== CORE PROCESSING LOGIC ======
+# ====== COLUMN STANDARDIZATION (FIX FOR YOUR ERROR) ======
+
+def _normalize_col_name(name: str) -> str:
+    """Lowercase, strip, collapse spaces for matching."""
+    if name is None:
+        return ""
+    return " ".join(str(name).strip().lower().split())
+
+
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Map columns in the uploaded file to our expected constant names
+    using a case-insensitive, space-insensitive match.
+    If a match is found, rename the column in df to the constant name.
+    """
+    df = df.copy()
+
+    # Map normalized existing names -> original names
+    existing_norm = {_normalize_col_name(c): c for c in df.columns}
+
+    # All required / used columns
+    expected_cols = [
+        TRACKED_COL,
+        PICKUP_TS_COL,
+        DROPOFF_TS_COL,
+        BILL_OF_LADING_COL,
+        PICKUP_NAME_COL,
+        PICKUP_CITY_COL,
+        PICKUP_STATE_COL,
+        PICKUP_COUNTRY_COL,
+        DROPOFF_NAME_COL,
+        DROPOFF_CITY_COL,
+        DROPOFF_STATE_COL,
+        DROPOFF_COUNTRY_COL,
+    ]
+
+    rename_map = {}
+    for expected in expected_cols:
+        norm_expected = _normalize_col_name(expected)
+        if norm_expected in existing_norm:
+            original_name = existing_norm[norm_expected]
+            # Rename the original column to the exact expected constant
+            rename_map[original_name] = expected
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    return df
+
 
 def validate_columns(df: pd.DataFrame):
     required_cols = [
@@ -48,7 +96,7 @@ def validate_columns(df: pd.DataFrame):
 def get_tracked_untracked_masks(df: pd.DataFrame):
     """
     Use the TRACKED_COL to build boolean masks for tracked and untracked.
-    Assumes values TRUE/FALSE, but also robust to 'True'/'False' strings.
+    Assumes values TRUE/FALSE, but also robust to 'True'/'False' strings and actual booleans.
     """
     tracked_series = df[TRACKED_COL].astype(str).str.upper().str.strip()
     tracked_mask = tracked_series == "TRUE"
@@ -61,12 +109,14 @@ def compute_in_transit(df_tracked: pd.DataFrame):
     For tracked shipments:
     - Classify missed milestones (missing timestamps / non-positive duration)
     - Compute rounded in-transit time for valid shipments
+
     Returns:
       detail_df: dataframe of shipments with VALID in-transit time (one row per shipment)
       missed_milestone_count: count of rows with missing/invalid timestamps or non-positive duration
     """
-    # Ensure datetime
     df_tracked = df_tracked.copy()
+
+    # Ensure datetime
     df_tracked[PICKUP_TS_COL] = pd.to_datetime(
         df_tracked[PICKUP_TS_COL], errors="coerce", utc=True
     )
@@ -133,9 +183,15 @@ def compute_in_transit(df_tracked: pd.DataFrame):
     return detail_df, missed_milestone_count
 
 
-def build_excel_file(tracked_count, untracked_count, missed_milestone_count, detail_df: pd.DataFrame) -> bytes:
-    grand_total = tracked_count + untracked_count  # total rows in original file (tracked + untracked)
-    # Note: tracked_count = valid + missed; we receive tracked_count directly.
+def build_excel_file(
+    tracked_count: int,
+    untracked_count: int,
+    missed_milestone_count: int,
+    detail_df: pd.DataFrame,
+    original_total_count: int,
+) -> bytes:
+    # Grand total = total number of rows in original file
+    grand_total = original_total_count
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm:ss") as writer:
@@ -162,7 +218,7 @@ def build_excel_file(tracked_count, untracked_count, missed_milestone_count, det
         worksheet.write("A5", "Grand total")
         worksheet.write("B5", grand_total)
 
-        # Blank row 6 (index 5) – nothing to do
+        # Blank row 6 (index 5) – intentionally left blank
 
         # Detailed tracked shipments table header at row 7 (index 6)
         headers = [
@@ -183,25 +239,31 @@ def build_excel_file(tracked_count, untracked_count, missed_milestone_count, det
 
         # Data starts at row 8 (index 7)
         start_row_idx = 7
-        for row_offset, row in enumerate(detail_df.itertuples(index=False), start=0):
+        for row_offset, (_, row) in enumerate(detail_df.iterrows()):
             excel_row = start_row_idx + row_offset
-            worksheet.write(excel_row, 0, getattr(row, BILL_OF_LADING_COL.replace(" ", "_")))
-            worksheet.write(excel_row, 1, getattr(row, PICKUP_NAME_COL.replace(" ", "_")))
-            worksheet.write(excel_row, 2, getattr(row, PICKUP_CITY_COL.replace(" ", "_")))
-            worksheet.write(excel_row, 3, getattr(row, PICKUP_STATE_COL.replace(" ", "_")))
-            worksheet.write(excel_row, 4, getattr(row, PICKUP_COUNTRY_COL.replace(" ", "_")))
-            worksheet.write(excel_row, 5, getattr(row, DROPOFF_NAME_COL.replace(" ", "_")))
-            worksheet.write(excel_row, 6, getattr(row, DROPOFF_CITY_COL.replace(" ", "_")))
-            worksheet.write(excel_row, 7, getattr(row, DROPOFF_STATE_COL.replace(" ", "_")))
-            worksheet.write(excel_row, 8, getattr(row, DROPOFF_COUNTRY_COL.replace(" ", "_")))
-            worksheet.write(excel_row, 9, getattr(row, IN_TRANSIT_OUTPUT_COL.replace(" ", "_")))
+            worksheet.write(excel_row, 0, row[BILL_OF_LADING_COL])
+            worksheet.write(excel_row, 1, row[PICKUP_NAME_COL])
+            worksheet.write(excel_row, 2, row[PICKUP_CITY_COL])
+            worksheet.write(excel_row, 3, row[PICKUP_STATE_COL])
+            worksheet.write(excel_row, 4, row[PICKUP_COUNTRY_COL])
+            worksheet.write(excel_row, 5, row[DROPOFF_NAME_COL])
+            worksheet.write(excel_row, 6, row[DROPOFF_CITY_COL])
+            worksheet.write(excel_row, 7, row[DROPOFF_STATE_COL])
+            worksheet.write(excel_row, 8, row[DROPOFF_COUNTRY_COL])
+            worksheet.write(excel_row, 9, row[IN_TRANSIT_OUTPUT_COL])
 
     output.seek(0)
     return output.getvalue()
 
 
-def build_csv_file(tracked_count, untracked_count, missed_milestone_count, detail_df: pd.DataFrame) -> str:
-    grand_total = tracked_count + untracked_count
+def build_csv_file(
+    tracked_count: int,
+    untracked_count: int,
+    missed_milestone_count: int,
+    detail_df: pd.DataFrame,
+    original_total_count: int,
+) -> str:
+    grand_total = original_total_count
     max_cols = 10  # A–J
 
     def pad_row(values):
@@ -278,7 +340,10 @@ def build_csv_file(tracked_count, untracked_count, missed_milestone_count, detai
 
 
 def process_file(df: pd.DataFrame):
+    # Validate columns after standardization
     validate_columns(df)
+
+    original_total_count = len(df)
 
     tracked_mask, untracked_mask = get_tracked_untracked_masks(df)
 
@@ -291,7 +356,6 @@ def process_file(df: pd.DataFrame):
     # Compute in-transit & missed milestones within tracked
     detail_df, missed_milestone_count = compute_in_transit(df_tracked)
 
-    # Sanity check: within tracked: tracked_count = valid + missed
     actual_tracked_with_valid_transit = len(detail_df)
 
     # Build files for download
@@ -300,19 +364,21 @@ def process_file(df: pd.DataFrame):
         untracked_count=untracked_count,
         missed_milestone_count=missed_milestone_count,
         detail_df=detail_df,
+        original_total_count=original_total_count,
     )
     csv_str = build_csv_file(
         tracked_count=tracked_count,
         untracked_count=untracked_count,
         missed_milestone_count=missed_milestone_count,
         detail_df=detail_df,
+        original_total_count=original_total_count,
     )
 
     summary_counts = {
         "tracked_count": tracked_count,
         "missed_milestone_count": missed_milestone_count,
         "untracked_count": untracked_count,
-        "grand_total": tracked_count + untracked_count,
+        "grand_total": original_total_count,
         "actual_tracked_with_valid_transit": actual_tracked_with_valid_transit,
     }
 
@@ -344,8 +410,13 @@ if uploaded_file is not None:
         else:
             df_input = pd.read_excel(uploaded_file)
 
+        # Normalize/standardize column names to match our constants
+        df_input = standardize_columns(df_input)
+
         st.subheader("Preview of uploaded data")
         st.dataframe(df_input.head(20), use_container_width=True)
+        # Uncomment this line if you want to debug column names:
+        # st.write("Columns after standardization:", list(df_input.columns))
 
         if st.button("Process file"):
             with st.spinner("Processing shipments..."):
